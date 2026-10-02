@@ -169,7 +169,7 @@ class GameRoom:
             loop = asyncio.get_event_loop()
             move = await loop.run_in_executor(
                 None,
-                lambda: get_agent_move(e.clone(), iterations=450)
+                lambda: get_agent_move(e.clone(), iterations=700)
             )
 
             e.apply_move(move)
