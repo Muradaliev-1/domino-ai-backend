@@ -167,9 +167,10 @@ class GameRoom:
 
             # Agent hamlesi thread'de hesapla (async'i bloklamasın)
             loop = asyncio.get_event_loop()
+            await asyncio.sleep(0.5) 
             move = await loop.run_in_executor(
                 None,
-                lambda: get_agent_move(e.clone(), iterations=20000)
+                lambda: get_agent_move(e.clone(), iterations=5000)
             )
 
             e.apply_move(move)
