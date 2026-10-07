@@ -73,7 +73,7 @@ except ImportError:
 # ODA YÖNETİCİSİ
 # ═══════════════════════════════════════════════════════════
 
-@dataclass_workaround = None  # dataclass yerine dict kullanacağız
+dataclass_workaround = None  # dataclass yerine dict kullanacağız
 
 class GameRoom:
     def __init__(self, room_id: str):
