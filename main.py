@@ -73,6 +73,7 @@ except ImportError:
 # ODA YÖNETİCİSİ
 # ═══════════════════════════════════════════════════════════
 
+@dataclass_workaround = None  # dataclass yerine dict kullanacağız
 
 class GameRoom:
     def __init__(self, room_id: str):
@@ -167,10 +168,9 @@ class GameRoom:
 
             # Agent hamlesi thread'de hesapla (async'i bloklamasın)
             loop = asyncio.get_event_loop()
-            await asyncio.sleep(1.0) 
             move = await loop.run_in_executor(
                 None,
-                lambda: get_agent_move(e.clone(), iterations=5000)
+                lambda: get_agent_move(e.clone(), iterations=300)
             )
 
             e.apply_move(move)
@@ -242,6 +242,12 @@ class GameRoom:
                 await self.send_to(s, self.game_state_message(s))
             await self.end_game()
         else:
+            # Önce insan oyuncuların yeni durumu görmesi için game_state gönder
+            for s in self.human_slots:
+                await self.send_to(s, self.game_state_message(s))
+            # Frontend animasyonunun bitmesi için bekle (300ms)
+            await asyncio.sleep(0.3)
+            # Sonra agent düşünmeye başlasın
             await self.maybe_agent_move()
 
     async def end_game(self):
@@ -274,7 +280,6 @@ app = FastAPI(title="Domino AI")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
