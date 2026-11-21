@@ -34,6 +34,13 @@ BOT_DELAY = float(os.environ.get("DOMINO_BOT_DELAY", "0.8"))
 START_DELAY = 0.6   # tur başında ilk bot hamlesinden önce bekleme (sn), bkz. start_game
 
 
+def same_player(names: Dict[int, str]) -> bool:
+    """İki sekmeden aynı ad (büyük/küçük harf ve baştaki/sondaki boşluk önemsiz) → aynı kişi, takım iki eli biliyor.
+    Adların kendisi kayda yazılmaz, yalnız bu bayrak."""
+    ns = [str(names.get(s, "")).strip().casefold() for s in (0, 1)]
+    return bool(ns[0]) and ns[0] == ns[1]
+
+
 # ═══════════════════════════════════════════════════════════
 # ODA YÖNETİCİSİ
 # ═══════════════════════════════════════════════════════════
@@ -86,6 +93,7 @@ class GameRoom:
         """Yeni tur (maç bittiyse yeni maç). Tur ortasında çağrılmaz."""
         if self.game is None:
             self.game = DemoGame(seed=self.seed, room_id=self.room_id)
+        self.game.team_full_info = same_player(self.human_names)
         self.game.start_round()
         self.game_started = True
 

@@ -78,13 +78,16 @@ class DemoGame:
     """Bir odanın maçı. Taşıma (WebSocket) main.py'de; burada yalnız durum ve kurallar."""
 
     def __init__(self, seed: Optional[str] = None, bot: Optional[str] = None,
-                 record_to: Optional[str] = None, room_id: str = ""):
+                 record_to: Optional[str] = None, room_id: str = "", team_full_info: bool = False):
         self.base_seed = seed if seed is not None else secrets.token_hex(8)
         self.match_no = 1
         self.seed = f"{self.base_seed}:m1"
         self.bot = bot or bot_name()
         self.record_to = record_to if record_to is not None else record_path()
         self.room_id = room_id
+        # True: iki insan koltuğunu (P0, P2) aynı kişi oynuyor, takım iki eli de biliyor (kurala aykırı güçlü rakip).
+        # Kayda yazılır ki bu turlar normal insan oyunu sanılmasın (D-27)
+        self.team_full_info = team_full_info
         self.match = Match(self.seed)
         self.round: Optional[Round] = None
         self.agents: dict = {}
@@ -141,7 +144,7 @@ class DemoGame:
         res = r.result
         meta = {"match_seed": self.seed, "round_no": self.match.round_no, "human_seats": list(HUMAN_SEATS),
                 "bots": self.bot, "match_before": self.match_before, "domino_version": domino_version(),
-                "room": self.room_id, "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                "room": self.room_id, "team_full_info": self.team_full_info, "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
         rec = from_round(r, "demo", meta).to_json()
         self.records.append(rec)
         if self.record_to:

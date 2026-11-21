@@ -9,6 +9,11 @@ import tempfile
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MUTANTS = [
+    ("team_full_info kayda hep False", "game.py", '"team_full_info": self.team_full_info,', '"team_full_info": False,'),
+    ("aynı ad karşılaştırması büyük/küçük harfe duyarlı", "main.py",
+     'str(names.get(s, "")).strip().casefold()', 'str(names.get(s, ""))'),
+    ("oda team_full_info bayrağını oyuna vermiyor", "main.py",
+     "        self.game.team_full_info = same_player(self.human_names)\n", ""),
     ("el sızıntısı: insana sonraki oyuncunun eli", "game.py",
      '"your_hand": [list(t) for t in r.hand(player)]', '"your_hand": [list(t) for t in r.hand((player + 1) % 4)]'),
     ("maç sonucu uygulanmıyor", "game.py", "        self.match.apply_result(res)\n", "        pass\n"),

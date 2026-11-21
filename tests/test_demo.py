@@ -8,6 +8,7 @@ T-DM3  Protokol: move_to_dict / move_from_dict gidiş-dönüş, aynalı 'R' (D-1
 T-DM4  İnsana giden durum mesajında başka elin taşı yok (yalnız your_hand), tur sonunda eller açılır.
 T-DM5  WebSocket uçtan uca: gerçek uvicorn sunucusu + iki websockets istemcisi, birkaç tur, kayıtlar replay ile TAMAM,
        ekrana gelen maç skoru referansla aynı, 'Tekrar Oyna' tur ortasında yeni tur başlatmaz.
+T-DM7  Aynı ad iki sekmeden → kayıt meta'sında team_full_info True (farklı ad → False); adın kendisi kayda yazılmaz.
 T-DM6  Vendored `domino` paketi domino-research'teki kaynakla birebir (kaynak klasör yoksa atlanır).
 """
 import asyncio
@@ -452,6 +453,41 @@ async def _delayed(coro):
 
 
 # ── T-DM6 vendored paket ─────────────────────────────────────
+
+def test_DM7_same_name_marks_team_full_info():
+    import main
+    assert main.same_player({0: "Murad", 1: " murad "}) and not main.same_player({0: "Murad", 1: "Ali"})
+    assert not main.same_player({0: "", 1: ""}) and not main.same_player({0: "Murad"})
+
+    class FakeWS:
+        async def send_text(self, _):
+            pass
+
+    old = main.START_DELAY
+    main.START_DELAY = 0
+    try:
+        for names, expect in (({0: "Murad", 1: "MURAD"}, True), ({0: "Murad", 1: "Ali"}, False)):
+            with tempfile.TemporaryDirectory() as d:
+                room = main.GameRoom("t", seed="dm7")
+                room.human_slots = {0: FakeWS(), 1: FakeWS()}
+                room.human_names = dict(names)
+                asyncio.run(room.start_game())
+                g = room.game
+                g.record_to = os.path.join(d, "x.jsonl")
+                rng = random.Random(7)
+                while not g.round_over:
+                    r = g.round
+                    if r.current_player in (0, 2):
+                        g.human_move(r.current_player, move_to_dict(rng.choice(r.legal_moves())))
+                    else:
+                        g.bot_step()
+                rec = g.records[-1]
+                assert rec["meta"]["team_full_info"] is expect
+                text = json.dumps(rec, ensure_ascii=False).casefold()
+                assert "murad" not in text and "ali\"" not in text
+    finally:
+        main.START_DELAY = old
+
 
 def test_DM6_vendored_package_matches_research_repo():
     if not os.path.isdir(os.path.join(RESEARCH_SRC, "domino")):
