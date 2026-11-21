@@ -1,89 +1,52 @@
-﻿"""
+"""
 main.py - Domino AI Backend
 ===========================
-FastAPI + WebSocket ile gerçek zamanlı domino oyunu.
+FastAPI + WebSocket ile gerçek zamanlı domino oyunu. 2 insan (P1, P3 = Takım A) vs 2 bot (P2, P4 = Takım B).
 
-Kurulum:
-    pip install fastapi uvicorn websockets torch numpy
+Motor, kurallar ve bot: araştırma çekirdeği `domino` (domino-research, sabit commit DOMINO_VERSION).
+Oyun mantığı game.py'de (testlenebilir); burada yalnız oda yönetimi ve WebSocket taşıması var.
+Bot gizli elleri görmez: yalnız kendi gözlemi + yasal hamleler + public maç durumu (game.bot_decide).
 
 Çalıştırma:
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    pip install -r requirements.txt
+    uvicorn main:app --host 0.0.0.0 --port 8000
 
-Oyun akışı:
-    1. İki insan /join endpoint'ine bağlanır
-    2. Oda doluşunca oyun başlar
-    3. İnsan hamleleri WebSocket üzerinden gelir
-    4. Agent hamleleri backend hesaplar, tüm oyunculara gönderir
+Ortam değişkenleri (isteğe bağlı): DOMINO_BOT (varsayılan: game.DEFAULT_BOT), DOMINO_RECORD_PATH
+(varsayılan records/demo.jsonl), DOMINO_BOT_DELAY (bot hamlesinden sonra bekleme, sn, varsayılan 0.8).
 """
 
 import asyncio
 import json
+import os
 import uuid
-import threading
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
-from domino_engine import (
-    DominoEngine, Move, create_game, get_agent_move, ALL_TILES
-)
+from domino.engine import IllegalMove
+from game import DemoGame, HUMAN_SEATS, bot_name, domino_version, move_to_dict, record_path
 
-# ── NN Model (opsiyonel — yoksa sadece MCTS kullanır) ────────
-MODEL_PATH = Path("models/best_model.pt")
-nn_model   = None
-
-try:
-    import torch
-    import torch.nn as nn
-
-    class DominoNet(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.trunk = nn.Sequential(
-                nn.Linear(150, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.5),
-                nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.5),
-                nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.5),
-                nn.Linear(256, 128), nn.BatchNorm1d(128), nn.ReLU(),
-            )
-            self.policy_head = nn.Sequential(nn.Linear(128,64), nn.ReLU(), nn.Linear(64,28))
-            self.value_head  = nn.Sequential(nn.Linear(128,32), nn.ReLU(), nn.Linear(32,1), nn.Tanh())
-
-        def forward(self, x):
-            t = self.trunk(x)
-            return self.policy_head(t), self.value_head(t)
-
-    if MODEL_PATH.exists():
-        device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-        nn_model   = DominoNet().to(device)
-        nn_model.load_state_dict(checkpoint["model_state_dict"])
-        nn_model.eval()
-        print(f"[NN] Model yuklendi — epoch {checkpoint['epoch']}, device={device}")
-    else:
-        print("[NN] Model bulunamadi, sadece MCTS kullanilacak")
-except ImportError:
-    print("[NN] PyTorch bulunamadi, sadece MCTS kullanilacak")
+BOT_DELAY = float(os.environ.get("DOMINO_BOT_DELAY", "0.8"))
+START_DELAY = 0.6   # tur başında ilk bot hamlesinden önce bekleme (sn), bkz. start_game
 
 
 # ═══════════════════════════════════════════════════════════
 # ODA YÖNETİCİSİ
 # ═══════════════════════════════════════════════════════════
 
-dataclass_workaround = None  # dataclass yerine dict kullanacağız
-
 class GameRoom:
-    def __init__(self, room_id: str):
-        self.room_id     = room_id
-        self.engine:     Optional[DominoEngine] = None
+    def __init__(self, room_id: str, seed: Optional[str] = None):
+        self.room_id = room_id
+        self.seed = seed
+        self.game: Optional[DemoGame] = None
 
-        # İnsan oyuncular: slot 0 = P1 (indeks 0), slot 1 = P3 (indeks 2)
-        # Agent: P2 (indeks 1), P4 (indeks 3)
-        self.human_slots: Dict[int, WebSocket] = {}  # {0: ws, 1: ws}
-        self.human_names: Dict[int, str]       = {}  # {0: "Ali", 1: "Veli"}
+        # İnsan oyuncular: slot 0 = P1 (indeks 0), slot 1 = P3 (indeks 2). Bot: P2 (1), P4 (3)
+        self.human_slots: Dict[int, WebSocket] = {}
+        self.human_names: Dict[int, str] = {}
 
         self.game_started = False
         self.lock = asyncio.Lock()
@@ -93,12 +56,11 @@ class GameRoom:
 
     def player_index(self, slot: int) -> int:
         """Slot 0 → oyuncu indeks 0, slot 1 → oyuncu indeks 2"""
-        return 0 if slot == 0 else 2
+        return HUMAN_SEATS[slot]
 
     async def broadcast(self, message: dict):
-        """Odadaki tüm insanlara mesaj gönder"""
         data = json.dumps(message, ensure_ascii=False)
-        for ws in self.human_slots.values():
+        for ws in list(self.human_slots.values()):
             try:
                 await ws.send_text(data)
             except Exception:
@@ -113,162 +75,101 @@ class GameRoom:
                 pass
 
     def game_state_message(self, for_slot: int) -> dict:
-        """Bir oyuncuya özel oyun durumu — sadece kendi eli görünür"""
-        e       = self.engine
-        p_index = self.player_index(for_slot)
+        """Bir oyuncuya özel oyun durumu — yalnız kendi eli görünür"""
+        return self.game.state_for(self.player_index(for_slot), self.human_names)
 
-        moves = []
-        if not e.is_game_over and e.current_player == p_index:
-            moves = [m.to_dict() for m in e.get_legal_moves()]
-
-        return {
-            "type":           "game_state",
-            "board":          [list(t) for t in e.board],
-            "your_hand":      [list(t) for t in e.players[p_index]],
-            "your_index":     p_index,
-            "current_player": e.current_player,
-            "is_your_turn":   e.current_player == p_index and not e.is_game_over,
-            "legal_moves":    moves,
-            "left_val":       e.left_val,
-            "right_val":      e.right_val,
-            "hand_sizes":     [len(h) for h in e.players],
-            "pass_count":     e.pass_count,
-            "is_game_over":   e.is_game_over,
-            "team_scores":    [e.team_score(0), e.team_score(1)],
-            "players":        self.human_names,
-            "missing_numbers": e.missing,
-        }
+    async def send_states(self):
+        for slot in list(self.human_slots):
+            await self.send_to(slot, self.game_state_message(slot))
 
     async def start_game(self):
-        self.engine       = create_game()
+        """Yeni tur (maç bittiyse yeni maç). Tur ortasında çağrılmaz."""
+        if self.game is None:
+            self.game = DemoGame(seed=self.seed, room_id=self.room_id)
+        self.game.start_round()
         self.game_started = True
 
         await self.broadcast({
             "type":    "game_started",
-            "message": "Oyun basladi! (1|1) ile acildi.",
+            "message": self.game.opening_text(),
             "players": self.human_names,
         })
-
-        # Güncel durumu gönder
-        for slot in self.human_slots:
-            await self.send_to(slot, self.game_state_message(slot))
-
-        # Eğer agent sırası geldiyse hemen oynasın
+        await self.send_states()
+        # Frontend ilk durumu 100 ms gecikmeyle işliyor (GameScene firstState); bot ondan önce oynarsa eski durum
+        # yenisinin üstüne çizilir. Eski MCTS ~0,5 sn düşündüğü için görünmüyordu, yeni bot daha hızlı.
+        await asyncio.sleep(START_DELAY)
         await self.maybe_agent_move()
 
     async def maybe_agent_move(self):
-        """Sıra agent'taysa hamle yaptır"""
-        e = self.engine
-        while not e.is_game_over and e.current_player in (1, 3):
+        """Sıra bottaysa hamle yaptır"""
+        g = self.game
+        moved = False
+        while g.is_bot_turn():
+            moved = True
+            player = g.round.current_player
             await self.broadcast({
                 "type":    "agent_thinking",
-                "player":  e.current_player,
-                "message": f"Agent (Oyuncu {e.current_player + 1}) dusunuyor..."
+                "player":  player,
+                "message": f"Bot (Oyuncu {player + 1}) düşünüyor..."
             })
-
-            # Agent hamlesi thread'de hesapla (async'i bloklamasın)
-            loop = asyncio.get_event_loop()
-            move = await loop.run_in_executor(
-                None,
-                lambda: get_agent_move(e.clone(), iterations=5000)
-            )
-
-            e.apply_move(move)
+            # Hesap thread'de (event loop bloklanmasın). Bot yalnız kendi gözlemini görür (game.bot_decide).
+            loop = asyncio.get_running_loop()
+            actor, move = await loop.run_in_executor(None, g.bot_step)
 
             await self.broadcast({
                 "type":   "agent_move",
-                "player": (e.current_player - 1) % 4,  # hamleyi yapan
-                "move":   move.to_dict(),
-                "board":  [list(t) for t in e.board],
+                "player": actor,                       # hamleyi yapan (B-09 düzeltildi)
+                "move":   move_to_dict(move),
+                "board":  [list(t) for t in g.round.board],
             })
-
-            # Kısa bekleme (UI'da görünsün)
-            await asyncio.sleep(0.8)
-
-            # Oyun bittiyse çık
-            if e.is_game_over:
+            if g.round_over:
                 break
+            await asyncio.sleep(BOT_DELAY)
 
-        # Tüm oyunculara güncel durum
-        for slot in self.human_slots:
-            await self.send_to(slot, self.game_state_message(slot))
-
-        if e.is_game_over:
+        if moved:                                   # bot oynamadıysa durum zaten gönderildi (çift mesaj yok)
+            await self.send_states()
+        if g.round_over:
             await self.end_game()
 
     async def handle_human_move(self, slot: int, move_data: dict):
-        e       = self.engine
+        g = self.game
         p_index = self.player_index(slot)
-
-        if e.is_game_over or e.current_player != p_index:
-            await self.send_to(slot, {"type": "error", "message": "Simdi senin siran degil!"})
+        if g is None or g.round_over or g.round.current_player != p_index:
+            await self.send_to(slot, {"type": "error", "message": "Şimdi senin sıran değil!"})
             return
-
-        # Hamleyi parse et
         try:
-            if move_data.get("is_pass"):
-                move = Move(is_pass=True)
-            else:
-                tile    = tuple(move_data["tile"])
-                to_left = bool(move_data["to_left"])
-                move    = Move(tile=tile, to_left=to_left)
+            move = g.human_move(p_index, move_data)
+        except IllegalMove:
+            await self.send_to(slot, {"type": "error", "message": "Yasadışı hamle!"})
+            return
         except Exception as ex:
-            await self.send_to(slot, {"type": "error", "message": f"Gecersiz hamle: {ex}"})
+            await self.send_to(slot, {"type": "error", "message": f"Geçersiz hamle: {ex}"})
             return
-
-        # Yasal mı kontrol et
-        legal = e.get_legal_moves()
-        valid = any(
-            (m.is_pass == move.is_pass and
-             (move.is_pass or (m.tile == move.tile and m.to_left == move.to_left)))
-            for m in legal
-        )
-        if not valid:
-            await self.send_to(slot, {"type": "error", "message": "Yasadisi hamle!"})
-            return
-
-        e.apply_move(move)
 
         await self.broadcast({
             "type":   "human_move",
             "player": p_index,
-            "name":   self.human_names.get(slot, f"Oyuncu {p_index+1}"),
-            "move":   move.to_dict(),
-            "board":  [list(t) for t in e.board],
+            "name":   self.human_names.get(slot, f"Oyuncu {p_index + 1}"),
+            "move":   move_to_dict(move),
+            "board":  [list(t) for t in g.round.board],
         })
-
-        if e.is_game_over:
-            for s in self.human_slots:
-                await self.send_to(s, self.game_state_message(s))
+        await self.send_states()
+        if g.round_over:
             await self.end_game()
         else:
-            # Önce insan oyuncuların yeni durumu görmesi için game_state gönder
-            for s in self.human_slots:
-                await self.send_to(s, self.game_state_message(s))
-            # Frontend animasyonunun bitmesi için bekle (300ms)
-            await asyncio.sleep(0.3)
-            # Sonra agent düşünmeye başlasın
+            await asyncio.sleep(0.3)               # frontend animasyonu
             await self.maybe_agent_move()
 
+    async def handle_rematch(self, slot: int):
+        """'Tekrar Oyna': yalnız tur bittiyse yeni tur (B-10 kısmen). Tur sürüyorsa (diğer insan zaten
+        başlattı) durumu bu oyuncuya yeniden gönder: frontend butona basınca masayı temizliyor."""
+        if self.game is not None and not self.game.round_over:
+            await self.send_to(slot, self.game_state_message(slot))
+            return
+        await self.start_game()
+
     async def end_game(self):
-        e  = self.engine
-        a  = e.team_score(0)
-        b  = e.team_score(1)
-
-        if a < b:
-            winner = "Takim A (Siz) kazandi!"
-        elif b < a:
-            winner = "Takim B (Agent) kazandi!"
-        else:
-            winner = "Berabere!"
-
-        await self.broadcast({
-            "type":        "game_over",
-            "team_a_score": a,
-            "team_b_score": b,
-            "winner":      winner,
-            "hands":       [[list(t) for t in e.players[i]] for i in range(4)],
-        })
+        await self.broadcast(self.game.round_over_message())
 
 
 # ═══════════════════════════════════════════════════════════
@@ -288,11 +189,13 @@ app.add_middleware(
 rooms: Dict[str, GameRoom] = {}
 # Bekleyen oda (dolmamış)
 waiting_room: Optional[str] = None
+# Testler için: yeni odaların maç tohumu (None = rastgele)
+ROOM_SEED: Optional[str] = None
 
 
 @app.get("/")
 async def root():
-    return {"status": "Domino AI Backend", "nn_loaded": nn_model is not None}
+    return {"status": "Domino AI Backend", "bot": bot_name(), "domino_version": domino_version()}
 
 
 @app.get("/rooms")
@@ -301,6 +204,14 @@ async def list_rooms():
         "active_rooms": len(rooms),
         "waiting":      waiting_room is not None
     }
+
+
+@app.get("/records")
+async def get_records():
+    """Biten turların kaydı (JSONL, domino.record biçimi, oyuncu adı yok). Render diski kalıcı değil: hemen indir."""
+    p = record_path()
+    text = open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+    return PlainTextResponse(text, media_type="application/x-ndjson")
 
 
 @app.websocket("/ws/{player_name}")
@@ -317,7 +228,7 @@ async def websocket_endpoint(ws: WebSocket, player_name: str):
         waiting_room = None
     else:
         room_id      = str(uuid.uuid4())[:8]
-        room         = GameRoom(room_id)
+        room         = GameRoom(room_id, seed=ROOM_SEED)
         rooms[room_id] = room
         slot         = 0
         waiting_room = room_id
@@ -329,17 +240,18 @@ async def websocket_endpoint(ws: WebSocket, player_name: str):
         "type":    "joined",
         "room_id": room_id,
         "slot":    slot,
-        "message": f"Odaya katildin! Sen Oyuncu {room.player_index(slot) + 1} (Takim A) olacaksin.",
+        "message": f"Odaya katıldın! Sen Oyuncu {room.player_index(slot) + 1} (Takım A) olacaksın.",
         "waiting": not room.is_full(),
-    }))
+    }, ensure_ascii=False))
 
     if room.is_full():
         await room.broadcast({
             "type":    "room_full",
-            "message": f"Oda doldu! {room.human_names[0]} ve {room.human_names[1]} hazir. Oyun basliyor...",
+            "message": f"Oda doldu! {room.human_names[0]} ve {room.human_names[1]} hazır. Oyun başlıyor...",
         })
         await asyncio.sleep(1)
-        await room.start_game()
+        async with room.lock:
+            await room.start_game()
 
     # Mesaj döngüsü
     try:
@@ -353,7 +265,7 @@ async def websocket_endpoint(ws: WebSocket, player_name: str):
 
             elif msg.get("type") == "rematch":
                 async with room.lock:
-                    await room.start_game()
+                    await room.handle_rematch(slot)
 
             elif msg.get("type") == "ping":
                 await ws.send_text(json.dumps({"type": "pong"}))
@@ -363,7 +275,7 @@ async def websocket_endpoint(ws: WebSocket, player_name: str):
         room.human_slots.pop(slot, None)
         await room.broadcast({
             "type":    "player_left",
-            "message": f"{player_name} oyundan ayrildi.",
+            "message": f"{player_name} oyundan ayrıldı.",
         })
         if not room.human_slots:
             rooms.pop(room_id, None)

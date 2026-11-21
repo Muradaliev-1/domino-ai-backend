@@ -1,0 +1,89 @@
+"""Demo backend mutasyon kontrolü: her mutant bilerek bozulmuş bir kopya; tests/run.py her birini YAKALAMALI.
+Önce mutasyonsuz temel koşu geçmek zorunda (geçmezse çıkış kodu 2). Backend klasöründen: python tools/mutation_check.py"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+MUTANTS = [
+    ("el sızıntısı: insana sonraki oyuncunun eli", "game.py",
+     '"your_hand": [list(t) for t in r.hand(player)]', '"your_hand": [list(t) for t in r.hand((player + 1) % 4)]'),
+    ("maç sonucu uygulanmıyor", "game.py", "        self.match.apply_result(res)\n", "        pass\n"),
+    ("taraf ters çevrilmiş", "game.py", 'return Move(t, "L" if d.get("to_left") else "R")',
+     'return Move(t, "R" if d.get("to_left") else "L")'),
+    ("bota Round nesnesi gidiyor", "game.py",
+     "mv = bot_decide(self.agents[p], r.observation(p), r.legal_moves(), self.match.public_state())",
+     "mv = bot_decide(self.agents[p], r.observation(p), r.legal_moves(), r)"),
+    ("bot RNG'si gizli elle tohumlanıyor (sızıntı)", "game.py",
+     "mv = bot_decide(self.agents[p], r.observation(p), r.legal_moves(), self.match.public_state())",
+     "self.agents[p].rng.seed(str(r.hand((p + 1) % 4)))\n"
+     "        mv = bot_decide(self.agents[p], r.observation(p), r.legal_moves(), self.match.public_state())"),
+    ("bot partnerin gözlemini görüyor", "game.py",
+     "mv = bot_decide(self.agents[p], r.observation(p),", "mv = bot_decide(self.agents[p], r.observation((p + 2) % 4),"),
+    ("tur sonu sayılan toplamlar ters", "game.py", 'counted[1 - res.winner_team] = res.points',
+     'counted[res.winner_team] = res.points'),
+    ("kayıt yazılmıyor", "game.py", "        self.records.append(rec)\n", "        pass\n"),
+    ("13 eşiği yok", "game.py", "        self.match = Match(self.seed)\n        self.round",
+     "        self.match = Match(self.seed)\n        self.match.cfg.threshold = 0\n        self.round"),
+    ("tur ortasında 'Tekrar Oyna' yeni tur başlatıyor (B-10)", "main.py",
+     "if self.game is not None and not self.game.round_over:", "if False:"),
+    ("hamleyi yapan yanlış etiketli (B-09)", "main.py", '"player": actor,',
+     '"player": (g.round.current_player - 1) % 4,'),
+    ("insana giden durumda maç skoru yerine el toplamları", "game.py",
+     '"team_scores": list(self.match.score),', '"team_scores": list(r.team_totals()) if r else [0, 0],'),
+    ("vendored motor kurala aykırı (R-12 yok)", "domino/engine.py",
+     "        return ZERO_ZERO_SINGLE_VALUE\n", "        return 0\n"),
+]
+
+
+def run_tests(root):
+    out = subprocess.run([sys.executable, os.path.join(root, "tests", "run.py")], capture_output=True, text=True,
+                         cwd=root, env={**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"})
+    return out.returncode == 0, out.stdout
+
+
+def copy_tree(dst):
+    for name in ("game.py", "main.py", "DOMINO_VERSION"):
+        shutil.copy2(os.path.join(HERE, name), dst)
+    for d in ("domino", "tests", "tools"):
+        shutil.copytree(os.path.join(HERE, d), os.path.join(dst, d), ignore=shutil.ignore_patterns("__pycache__"))
+
+
+def main():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = os.path.join(tmp, "base")
+        os.makedirs(base)
+        copy_tree(base)
+        ok, out = run_tests(base)
+        if not ok:
+            print("TEMEL KOŞU BAŞARISIZ (mutasyonsuz):\n" + out[-3000:])
+            return 2
+        print("temel koşu geçti")
+        caught = 0
+        for i, (name, rel, old, new) in enumerate(MUTANTS):
+            d = os.path.join(tmp, f"m{i}")
+            os.makedirs(d)
+            copy_tree(d)
+            path = os.path.join(d, rel)
+            src = open(path, encoding="utf-8").read()
+            if src.count(old) != 1:
+                print(f"  ??  {name}: kalıp {src.count(old)} kez bulundu (1 olmalı)")
+                continue
+            # vendored motoru değiştiren mutantta T-DM6 (kaynakla birebir) zaten yakalar; asıl soru davranış testleri
+            open(path, "w", encoding="utf-8").write(src.replace(old, new))
+            ok, out = run_tests(d)
+            failed = [l.split()[-1] for l in out.splitlines() if l.strip().startswith("FAIL")]
+            if ok:
+                print(f"  HAYATTA  {name}")
+            else:
+                caught += 1
+                print(f"  yakalandı  {name}  ({', '.join(failed)})")
+        print(f"\n{caught}/{len(MUTANTS)} mutant yakalandı")
+        return 0 if caught == len(MUTANTS) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
