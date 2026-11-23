@@ -616,7 +616,20 @@ async def _reconnect_session(port, main):
     await _recv_type(a4, ("game_state",))
     assert (await _recv_type(a4, ("game_over",)))["hands"] == over_a["hands"]
 
-    # 5) geçersiz jeton: yeni oda
+    # 5) geçersiz jeton: yeni oda (önce oyun başlamadan bekleme odasından çıkan: koltuk tutulmaz, sonraki ikili eşleşir)
+    w = await websockets.connect(uri + "W")
+    jw = json.loads(await w.recv())
+    assert jw["slot"] == 0 and jw["waiting"]
+    await w.close()
+    await asyncio.sleep(0.3)
+    assert jw["room_id"] not in main.rooms and main.waiting_room is None
+    p1 = await websockets.connect(uri + "P")
+    p2 = await websockets.connect(uri + "Q")
+    jp1, jp2 = json.loads(await p1.recv()), json.loads(await p2.recv())
+    assert jp1["slot"] == 0 and jp2["slot"] == 1 and jp1["room_id"] == jp2["room_id"] != jw["room_id"]
+    await _recv_type(p2, ("game_state",))
+    await p1.close()
+    await p2.close()
     c = await websockets.connect(uri + "C?token=yanlis")
     jc = json.loads(await c.recv())
     assert jc["resumed"] is False and jc["room_id"] != ja["room_id"]

@@ -370,7 +370,18 @@ async def _drop(ws: WebSocket, room: "GameRoom", room_id: str, slot: int, player
     """Bağlantı koptu: yalnız koltuktaki bağlantı buysa (yenisi gelmediyse) koltuk RECONNECT_GRACE sn tutulur."""
     if room.human_slots.get(slot) is not ws:
         return                                     # yerine yeni bağlantı geldi (yeniden bağlanma)
+    global waiting_room
     room.human_slots.pop(slot, None)
+    if not room.game_started:
+        # oyun başlamadan çıkan (bekleme odası): koltuk tutulmaz, eski davranış. Tutulsaydı sonraki gelen
+        # yarım odaya düşüp başlamayan oyunda beklerdi.
+        room.tokens.pop(slot, None)
+        room.human_names.pop(slot, None)
+        if not room.human_slots:
+            rooms.pop(room_id, None)
+            if waiting_room == room_id:
+                waiting_room = None
+        return
     gone_at = time.monotonic()
     room.gone[slot] = gone_at
     await room.broadcast({
