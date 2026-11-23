@@ -18,6 +18,8 @@ Ortam değişkenleri (isteğe bağlı): DOMINO_BOT (varsayılan: game.DEFAULT_BO
 import asyncio
 import json
 import os
+import secrets
+import time
 import uuid
 from typing import Dict, Optional
 from pathlib import Path
@@ -32,6 +34,9 @@ from game import DemoGame, HUMAN_SEATS, bot_name, domino_version, move_to_dict, 
 
 BOT_DELAY = float(os.environ.get("DOMINO_BOT_DELAY", "0.8"))
 START_DELAY = 0.6   # tur başında ilk bot hamlesinden önce bekleme (sn), bkz. start_game
+# Kopan insanın koltuğu bu kadar saniye tutulur; istemci `joined.token` ile `/ws/{ad}?token=...` üstünden aynı
+# koltuğa döner ve son durumu alır (D-32). Süre dolunca eski davranış: koltuk boşalır, oda boşsa silinir.
+RECONNECT_GRACE = float(os.environ.get("DOMINO_RECONNECT_GRACE", "60"))
 
 
 def same_player(names: Dict[int, str]) -> bool:
@@ -54,6 +59,8 @@ class GameRoom:
         # İnsan oyuncular: slot 0 = P1 (indeks 0), slot 1 = P3 (indeks 2). Bot: P2 (1), P4 (3)
         self.human_slots: Dict[int, WebSocket] = {}
         self.human_names: Dict[int, str] = {}
+        self.tokens: Dict[int, str] = {}           # yeniden bağlanma jetonu (koltuk başına, D-32)
+        self.gone: Dict[int, float] = {}           # bağlantısı kopan, koltuğu tutulan slotlar → kopma anı
 
         self.game_started = False
         self.lock = asyncio.Lock()
@@ -179,6 +186,40 @@ class GameRoom:
     async def end_game(self):
         await self.broadcast(self.game.round_over_message())
 
+    async def resync(self, slot: int):
+        """Yeniden bağlanan oyuncuya son durum: oyun durumu, tur bittiyse tur sonu mesajı da."""
+        if self.game is None or not self.game_started:
+            return
+        await self.send_to(slot, self.game_state_message(slot))
+        if self.game.round_over:
+            await self.send_to(slot, self.game.round_over_message())
+
+
+def find_seat(token: Optional[str]):
+    """Jetonun tuttuğu koltuk: (oda_id, oda, slot) ya da None."""
+    if not token:
+        return None
+    for rid, room in rooms.items():
+        for slot, tok in room.tokens.items():
+            if secrets.compare_digest(tok, token):
+                return rid, room, slot
+    return None
+
+
+async def expire_seat(room_id: str, slot: int, gone_at: float):
+    """Süre dolduğunda hâlâ dönmemişse koltuğu bırak; odada kimse kalmadıysa odayı sil."""
+    global waiting_room
+    await asyncio.sleep(RECONNECT_GRACE)
+    room = rooms.get(room_id)
+    if room is None or room.gone.get(slot) != gone_at:
+        return                                     # döndü ya da oda zaten yok
+    room.gone.pop(slot, None)
+    room.tokens.pop(slot, None)
+    if not room.human_slots:
+        rooms.pop(room_id, None)
+        if waiting_room == room_id:
+            waiting_room = None
+
 
 # ═══════════════════════════════════════════════════════════
 # FASTAPI UYGULAMASI
@@ -223,10 +264,44 @@ async def get_records():
 
 
 @app.websocket("/ws/{player_name}")
-async def websocket_endpoint(ws: WebSocket, player_name: str):
+async def websocket_endpoint(ws: WebSocket, player_name: str, token: Optional[str] = None):
     global waiting_room
 
     await ws.accept()
+
+    seat = find_seat(token)
+    if seat is not None:
+        # Yeniden bağlanma (D-32): aynı oda, aynı koltuk. Eski bağlantı hâlâ açıksa (sayfa yenileme) kapatılır.
+        room_id, room, slot = seat
+        old = room.human_slots.get(slot)
+        room.human_slots[slot] = ws
+        room.gone.pop(slot, None)
+        if old is not None and old is not ws:
+            try:
+                await old.close(code=4000)
+            except Exception:
+                pass
+        await ws.send_text(json.dumps({
+            "type":    "joined",
+            "room_id": room_id,
+            "slot":    slot,
+            "token":   room.tokens[slot],
+            "resumed": True,
+            "message": "Yeniden bağlandın.",
+            "waiting": not room.is_full(),
+        }, ensure_ascii=False))
+        async with room.lock:
+            await room.resync(slot)
+        for other in list(room.human_slots):
+            if other != slot:
+                await room.send_to(other, {"type": "player_back", "slot": slot,
+                                           "message": f"{room.human_names.get(slot, '')} geri döndü."})
+        if room.is_full() and not room.game_started:
+            async with room.lock:
+                if not room.game_started:
+                    await room.start_game()
+        await _message_loop(ws, room, room_id, slot, player_name)
+        return
 
     # Oda bul veya oluştur
     if waiting_room and waiting_room in rooms:
@@ -243,25 +318,32 @@ async def websocket_endpoint(ws: WebSocket, player_name: str):
 
     room.human_slots[slot] = ws
     room.human_names[slot] = player_name
+    room.tokens[slot] = secrets.token_urlsafe(18)
 
     await ws.send_text(json.dumps({
         "type":    "joined",
         "room_id": room_id,
         "slot":    slot,
+        "token":   room.tokens[slot],
+        "resumed": False,
         "message": f"Odaya katıldın! Sen Oyuncu {room.player_index(slot) + 1} (Takım A) olacaksın.",
         "waiting": not room.is_full(),
     }, ensure_ascii=False))
 
-    if room.is_full():
+    if room.is_full() and not room.game_started:
         await room.broadcast({
             "type":    "room_full",
             "message": f"Oda doldu! {room.human_names[0]} ve {room.human_names[1]} hazır. Oyun başlıyor...",
         })
         await asyncio.sleep(1)
         async with room.lock:
-            await room.start_game()
+            if not room.game_started:
+                await room.start_game()
 
-    # Mesaj döngüsü
+    await _message_loop(ws, room, room_id, slot, player_name)
+
+
+async def _message_loop(ws: WebSocket, room: "GameRoom", room_id: str, slot: int, player_name: str):
     try:
         while True:
             data = await ws.receive_text()
@@ -278,21 +360,26 @@ async def websocket_endpoint(ws: WebSocket, player_name: str):
             elif msg.get("type") == "ping":
                 await ws.send_text(json.dumps({"type": "pong"}))
 
-    except WebSocketDisconnect:
-        # Oyuncu ayrıldı
-        room.human_slots.pop(slot, None)
-        await room.broadcast({
-            "type":    "player_left",
-            "message": f"{player_name} oyundan ayrıldı.",
-        })
-        if not room.human_slots:
-            rooms.pop(room_id, None)
-            if waiting_room == room_id:
-                waiting_room = None
-
     except Exception as ex:
-        print(f"[WS] Hata: {ex}")
-        room.human_slots.pop(slot, None)
+        if not isinstance(ex, WebSocketDisconnect):
+            print(f"[WS] Hata: {ex}")
+    await _drop(ws, room, room_id, slot, player_name)
+
+
+async def _drop(ws: WebSocket, room: "GameRoom", room_id: str, slot: int, player_name: str):
+    """Bağlantı koptu: yalnız koltuktaki bağlantı buysa (yenisi gelmediyse) koltuk RECONNECT_GRACE sn tutulur."""
+    if room.human_slots.get(slot) is not ws:
+        return                                     # yerine yeni bağlantı geldi (yeniden bağlanma)
+    room.human_slots.pop(slot, None)
+    gone_at = time.monotonic()
+    room.gone[slot] = gone_at
+    await room.broadcast({
+        "type":    "player_left",
+        "slot":    slot,
+        "grace":   RECONNECT_GRACE,
+        "message": f"{player_name} bağlantısı koptu, bekleniyor...",
+    })
+    asyncio.create_task(expire_seat(room_id, slot, gone_at))
 
 
 # Frontend static dosyaları (build sonrası)

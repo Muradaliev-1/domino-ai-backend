@@ -502,3 +502,134 @@ def test_DM6_vendored_package_matches_research_repo():
     # sabitlenen commit, domino/ klasörünün son değiştiği commit'ten yeni (ya da aynı) olmalı
     anc = subprocess.run(["git", "-C", RESEARCH_SRC, "merge-base", "--is-ancestor", head, pinned])
     assert anc.returncode == 0, f"DOMINO_VERSION {pinned[:7]} domino/'nun son değişikliğini ({head[:7]}) içermiyor"
+
+
+# ── T-DM8 yeniden bağlanma (D-32) ────────────────────────────
+
+def test_DM8_reconnect_with_token_keeps_seat():
+    try:
+        import uvicorn
+        import websockets  # noqa: F401
+    except ImportError as ex:
+        raise unittest.SkipTest(f"uvicorn/websockets yok: {ex}")
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["DOMINO_RECORD_PATH"] = os.path.join(d, "rc.jsonl")
+        os.environ["DOMINO_BOT"] = "ismcts@10"
+        import main
+        main.BOT_DELAY = 0.0
+        main.ROOM_SEED = "testrc"
+        main.RECONNECT_GRACE = 30.0
+        main.rooms.clear()
+        main.waiting_room = None
+        port = _free_port()
+        server = uvicorn.Server(uvicorn.Config(main.app, host="127.0.0.1", port=port, log_level="warning"))
+        th = threading.Thread(target=server.run, daemon=True)
+        th.start()
+        t0 = time.time()
+        while not server.started:
+            assert time.time() - t0 < 20, "sunucu başlamadı"
+            time.sleep(0.05)
+        try:
+            asyncio.run(_reconnect_session(port, main))
+        finally:
+            server.should_exit = True
+            th.join(10)
+            os.environ.pop("DOMINO_RECORD_PATH", None)
+            os.environ.pop("DOMINO_BOT", None)
+            main.RECONNECT_GRACE = 60.0
+        recs = load_records(os.path.join(d, "rc.jsonl"))
+        assert len(recs) == 1 and replay(recs[0]).ok
+
+
+async def _recv_type(ws, types, timeout=30):
+    """`types` türünden ilk mesaja kadar oku (arada gelenler atlanır)."""
+    while True:
+        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+        if msg["type"] in types:
+            return msg
+
+
+async def _reconnect_session(port, main):
+    import websockets
+    uri = f"ws://127.0.0.1:{port}/ws/"
+    a1 = await websockets.connect(uri + "A")
+    ja = json.loads(await a1.recv())
+    assert ja["slot"] == 0 and ja["resumed"] is False and ja["token"]
+    b = await websockets.connect(uri + "B")
+    jb = json.loads(await b.recv())
+    assert jb["slot"] == 1 and jb["room_id"] == ja["room_id"] and jb["token"] != ja["token"]
+    st = await _recv_type(a1, ("game_state",))
+    hand_before = st["your_hand"]
+
+    # 1) kopma: koltuk tutulur, diğer oyuncu haber alır; jetonla dönünce aynı koltuk ve aynı el
+    await a1.close()
+    left = await _recv_type(b, ("player_left",))
+    assert left["slot"] == 0
+    assert 0 in main.rooms[ja["room_id"]].tokens
+    a2 = await websockets.connect(uri + "A?token=" + ja["token"])
+    j2 = json.loads(await a2.recv())
+    assert j2["resumed"] is True and j2["slot"] == 0 and j2["room_id"] == ja["room_id"]
+    st2 = await _recv_type(a2, ("game_state",))
+    assert st2["your_index"] == 0 and st2["your_hand"] == hand_before   # sıra A'da değilken eli değişmez
+    back = await _recv_type(b, ("player_back",))
+    assert back["slot"] == 0
+
+    # 2) eski bağlantı açıkken (sayfa yenileme) aynı jetonla yeni bağlantı: eskisi kapanır, yenisi koltukta kalır
+    a3 = await websockets.connect(uri + "A?token=" + ja["token"])
+    j3 = json.loads(await a3.recv())
+    assert j3["resumed"] is True and j3["slot"] == 0
+    st3 = await _recv_type(a3, ("game_state",))
+    try:
+        while True:
+            await asyncio.wait_for(a2.recv(), timeout=5)
+    except websockets.ConnectionClosed:
+        pass
+    await asyncio.sleep(0.2)
+    room = main.rooms[ja["room_id"]]
+    assert room.human_slots.get(0) is not None and 0 not in room.gone   # eski bağlantının kapanışı koltuğu düşürmedi
+
+    # 3) yeni bağlantıyla turu bitir (iki taraf rastgele yasal hamle)
+    rng = random.Random(5)
+
+    async def play(ws, first=None):
+        msg = first
+        while True:
+            if msg is None:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+            if msg["type"] == "game_over":
+                return msg
+            if msg["type"] == "game_state" and msg["is_your_turn"]:
+                await ws.send(json.dumps({"type": "move", **rng.choice(msg["legal_moves"])}))
+            elif msg["type"] == "error":
+                raise AssertionError(msg)
+            msg = None
+
+    await b.send(json.dumps({"type": "rematch"}))      # tur ortasında: durumu yeniden gönderir (atlanan mesajlar)
+    over_a, over_b = await asyncio.gather(play(a3, st3), play(b))
+    assert over_a["hands"] == over_b["hands"]
+
+    # 4) tur bittikten sonra dönen oyuncu tur sonu mesajını da alır
+    await a3.close()
+    await _recv_type(b, ("player_left",))
+    a4 = await websockets.connect(uri + "A?token=" + ja["token"])
+    assert json.loads(await a4.recv())["resumed"] is True
+    await _recv_type(a4, ("game_state",))
+    assert (await _recv_type(a4, ("game_over",)))["hands"] == over_a["hands"]
+
+    # 5) geçersiz jeton: yeni oda
+    c = await websockets.connect(uri + "C?token=yanlis")
+    jc = json.loads(await c.recv())
+    assert jc["resumed"] is False and jc["room_id"] != ja["room_id"]
+    await c.close()
+
+    # 6) süre dolunca jeton geçersiz: koltuk bırakılır, aynı jetonla dönen yeni odaya düşer
+    main.RECONNECT_GRACE = 0.3
+    await a4.close()
+    await _recv_type(b, ("player_left",))
+    await asyncio.sleep(0.8)
+    assert 0 not in main.rooms[ja["room_id"]].tokens
+    a5 = await websockets.connect(uri + "A?token=" + ja["token"])
+    j5 = json.loads(await a5.recv())
+    assert j5["resumed"] is False and j5["room_id"] != ja["room_id"]
+    await a5.close()
+    await b.close()
