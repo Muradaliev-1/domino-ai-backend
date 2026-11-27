@@ -51,9 +51,10 @@ def same_player(names: Dict[int, str]) -> bool:
 # ═══════════════════════════════════════════════════════════
 
 class GameRoom:
-    def __init__(self, room_id: str, seed: Optional[str] = None):
+    def __init__(self, room_id: str, seed: Optional[str] = None, players: int = 4):
         self.room_id = room_id
         self.seed = seed
+        self.players = players                     # 4: 2 insan + 2 bot; 2: 1 insan + 1 bot (R-20..R-28)
         self.game: Optional[DemoGame] = None
 
         # İnsan oyuncular: slot 0 = P1 (indeks 0), slot 1 = P3 (indeks 2). Bot: P2 (1), P4 (3)
@@ -66,11 +67,17 @@ class GameRoom:
         self.lock = asyncio.Lock()
 
     def is_full(self) -> bool:
-        return len(self.human_slots) == 2
+        return len(self.human_slots) == (2 if self.players == 4 else 1)
 
     def player_index(self, slot: int) -> int:
-        """Slot 0 → oyuncu indeks 0, slot 1 → oyuncu indeks 2"""
+        """Slot 0 → oyuncu indeks 0, slot 1 → oyuncu indeks 2 (2 kişilikte yalnız slot 0)"""
         return HUMAN_SEATS[slot]
+
+    async def broadcast_draws(self):
+        """Son hamleden sonra motorun yaptığı zorunlu çekişler (R-21): kim, kaç taş. Taşların kendisi gizli (R-28)."""
+        for player, count in self.game.draws:
+            await self.broadcast({"type": "drew", "player": player, "count": count,
+                                  "boneyard_size": len(self.game.round.boneyard)})
 
     async def broadcast(self, message: dict):
         data = json.dumps(message, ensure_ascii=False)
@@ -99,8 +106,8 @@ class GameRoom:
     async def start_game(self):
         """Yeni tur (maç bittiyse yeni maç). Tur ortasında çağrılmaz."""
         if self.game is None:
-            self.game = DemoGame(seed=self.seed, room_id=self.room_id)
-        self.game.team_full_info = same_player(self.human_names)
+            self.game = DemoGame(seed=self.seed, room_id=self.room_id, players=self.players)
+        self.game.team_full_info = self.players == 4 and same_player(self.human_names)
         self.game.start_round()
         self.game_started = True
 
@@ -137,6 +144,7 @@ class GameRoom:
                 "move":   move_to_dict(move),
                 "board":  [list(t) for t in g.round.board],
             })
+            await self.broadcast_draws()
             if g.round_over:
                 break
             await asyncio.sleep(BOT_DELAY)
@@ -168,6 +176,7 @@ class GameRoom:
             "move":   move_to_dict(move),
             "board":  [list(t) for t in g.round.board],
         })
+        await self.broadcast_draws()
         await self.send_states()
         if g.round_over:
             await self.end_game()
@@ -264,7 +273,8 @@ async def get_records():
 
 
 @app.websocket("/ws/{player_name}")
-async def websocket_endpoint(ws: WebSocket, player_name: str, token: Optional[str] = None):
+async def websocket_endpoint(ws: WebSocket, player_name: str, token: Optional[str] = None,
+                             mode: Optional[str] = None):
     global waiting_room
 
     await ws.accept()
@@ -289,6 +299,7 @@ async def websocket_endpoint(ws: WebSocket, player_name: str, token: Optional[st
             "resumed": True,
             "message": "Yeniden bağlandın.",
             "waiting": not room.is_full(),
+            "num_players": room.players,
         }, ensure_ascii=False))
         async with room.lock:
             await room.resync(slot)
@@ -303,8 +314,13 @@ async def websocket_endpoint(ws: WebSocket, player_name: str, token: Optional[st
         await _message_loop(ws, room, room_id, slot, player_name)
         return
 
-    # Oda bul veya oluştur
-    if waiting_room and waiting_room in rooms:
+    # Oda bul veya oluştur. mode=2: tek insan + bot, bekleme yok (2 kişilik, R-20..R-28)
+    if mode == "2":
+        room_id = str(uuid.uuid4())[:8]
+        room = GameRoom(room_id, seed=ROOM_SEED, players=2)
+        rooms[room_id] = room
+        slot = 0
+    elif waiting_room and waiting_room in rooms:
         room_id = waiting_room
         room    = rooms[room_id]
         slot    = 1
@@ -326,16 +342,19 @@ async def websocket_endpoint(ws: WebSocket, player_name: str, token: Optional[st
         "slot":    slot,
         "token":   room.tokens[slot],
         "resumed": False,
-        "message": f"Odaya katıldın! Sen Oyuncu {room.player_index(slot) + 1} (Takım A) olacaksın.",
+        "message": (f"Odaya katıldın! Sen Oyuncu {room.player_index(slot) + 1} (Takım A) olacaksın." if room.players == 4
+                    else "2 kişilik oyun: sen ve yapay zekâ."),
+        "num_players": room.players,
         "waiting": not room.is_full(),
     }, ensure_ascii=False))
 
     if room.is_full() and not room.game_started:
-        await room.broadcast({
-            "type":    "room_full",
-            "message": f"Oda doldu! {room.human_names[0]} ve {room.human_names[1]} hazır. Oyun başlıyor...",
-        })
-        await asyncio.sleep(1)
+        if room.players == 4:
+            await room.broadcast({
+                "type":    "room_full",
+                "message": f"Oda doldu! {room.human_names[0]} ve {room.human_names[1]} hazır. Oyun başlıyor...",
+            })
+            await asyncio.sleep(1)
         async with room.lock:
             if not room.game_started:
                 await room.start_game()

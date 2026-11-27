@@ -4,6 +4,9 @@ game.py - Demo oyun mantığı (taşıma katmanından bağımsız, senkron, test
 Kurallar ve motor: araştırma çekirdeği `domino` (domino-research, sabit commit: DOMINO_VERSION, D-15/D-26).
 - Tam maç: 101 puan, 13 eşiği, bekleyen puan, eşitlik havuzu (domino.engine.Match, 03 - Kurallar.md)
 - Koltuklar: P0 ve P2 insan (Takım A), P1 ve P3 bot (Takım B)
+- 2 kişilik mod (players=2, R-20..R-28, domino.engine.Match2): P0 insan, P1 bot. Bazar, 2'şer çekiş motorda.
+  Arama ajanları 4 kişilik gözlem varsayar; 2 kişide bot şimdilik `greedy` (gücü ölçülmedi). Kayıt ayrı
+  dosyaya (`demo2p.jsonl`), kendi biçiminde (başlangıç bazarı ve çekişlerle): tez `replay.py` 4 kişilik okur.
 - Bot YALNIZ kendi Observation'ını, yasal hamle listesini ve public maç durumunu görür (B-01 kapanışı).
   Bu kısıt `bot_decide` fonksiyonunda yapısaldır: ajana Round/Match nesnesi hiç gitmez.
 - Her biten tur domino.record biçiminde JSONL'e yazılır (tools/replay.py ile doğrulanır).
@@ -19,13 +22,15 @@ import time
 from typing import List, Optional, Sequence
 
 from domino.agents import Agent, make_agent
-from domino.engine import (PASS, IllegalMove, Match, Move, Observation, Round, RoundResult,
+from domino.engine import (PASS, IllegalMove, Match, Match2, Move, Observation, Round, RoundResult,
                            missing_from_events, norm, team_of)
 from domino.record import from_round
 
 HUMAN_SEATS = (0, 2)
 BOT_SEATS = (1, 3)
 DEFAULT_BOT = "ismcts-rand@200"
+DEFAULT_BOT_2P = "greedy"           # arama ajanları 4 kişilik; 2 kişide gücü ölçülmedi
+SEATS = {4: ((0, 2), (1, 3)), 2: ((0,), (1,))}   # oyuncu sayısı → (insan, bot) koltukları
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -43,6 +48,28 @@ def bot_name() -> str:
 
 def record_path() -> str:
     return os.environ.get("DOMINO_RECORD_PATH", os.path.join(BACKEND_DIR, "records", "demo.jsonl"))
+
+
+def record_path_2p() -> str:
+    return os.environ.get("DOMINO_RECORD_PATH_2P", os.path.join(BACKEND_DIR, "records", "demo2p.jsonl"))
+
+
+def record_2p(r, meta: dict) -> dict:
+    """2 kişilik tur kaydı: başlangıç elleri + bazar sırası + olaylar (çekiş dahil) → Round2 ile yeniden oynatılabilir."""
+    ev = []
+    for e in r.events:
+        if e.kind == "play":
+            ev.append({"player": e.player, "tile": list(e.tile), "side": e.side})
+        else:
+            ev.append({"player": e.player, e.kind: True})
+    res = r.result
+    return {"mode": "2p", "initial_hands": [[list(t) for t in h] for h in r.initial_hands],
+            "initial_boneyard": [list(t) for t in r.initial_boneyard], "starter": r.starter,
+            "forced_opening": list(r.forced_opening) if r.forced_opening else None, "events": ev,
+            "result": {"reason": res.reason, "winner_team": res.winner_team, "points": res.points,
+                       "pot_add": res.pot_add, "team_totals": list(res.team_totals),
+                       "last_tile_player": res.last_tile_player, "finisher": res.finisher},
+            "meta": meta}
 
 
 # ── Protokol dönüşümleri ─────────────────────────────────────
@@ -78,34 +105,43 @@ class DemoGame:
     """Bir odanın maçı. Taşıma (WebSocket) main.py'de; burada yalnız durum ve kurallar."""
 
     def __init__(self, seed: Optional[str] = None, bot: Optional[str] = None,
-                 record_to: Optional[str] = None, room_id: str = "", team_full_info: bool = False):
+                 record_to: Optional[str] = None, room_id: str = "", team_full_info: bool = False,
+                 players: int = 4):
+        if players not in SEATS:
+            raise ValueError("oyuncu sayısı 2 ya da 4")
+        self.players = players
+        self.human_seats, self.bot_seats = SEATS[players]
         self.base_seed = seed if seed is not None else secrets.token_hex(8)
         self.match_no = 1
         self.seed = f"{self.base_seed}:m1"
-        self.bot = bot or bot_name()
-        self.record_to = record_to if record_to is not None else record_path()
+        self.bot = bot or (bot_name() if players == 4 else DEFAULT_BOT_2P)
+        self.record_to = record_to if record_to is not None else (record_path() if players == 4 else record_path_2p())
         self.room_id = room_id
         # True: iki insan koltuğunu (P0, P2) aynı kişi oynuyor, takım iki eli de biliyor (kurala aykırı güçlü rakip).
         # Kayda yazılır ki bu turlar normal insan oyunu sanılmasın (D-27)
         self.team_full_info = team_full_info
-        self.match = Match(self.seed)
+        self.match = self._new_match()
         self.round: Optional[Round] = None
+        self.draws: List[tuple] = []       # son hamleden sonra yapılan çekişler: (oyuncu, taş sayısı), public
         self.agents: dict = {}
         self.match_before: dict = {}
         self.records: List[dict] = []     # bu maçta yazılan kayıtlar (test/inceleme için)
         self.last_result: Optional[RoundResult] = None
+
+    def _new_match(self):
+        return Match2(self.seed) if self.players == 2 else Match(self.seed)
 
     # -- tur
     def start_round(self) -> Round:
         if self.match.winner is not None:                # maç bitti: yeni maç
             self.match_no += 1
             self.seed = f"{self.base_seed}:m{self.match_no}"
-            self.match = Match(self.seed)
+            self.match = self._new_match()
         self.match_before = self.match.public_state()
         self.round = self.match.new_round()
         rn = self.match.round_no
         # Her tur her bot koltuğuna kendi tohumuyla yeni ajan (arena.py ile aynı düzen)
-        self.agents = {s: make_agent(self.bot, f"{self.seed}:{rn}:s{s}") for s in BOT_SEATS}
+        self.agents = {s: make_agent(self.bot, f"{self.seed}:{rn}:s{s}") for s in self.bot_seats}
         self.last_result = None
         return self.round
 
@@ -114,13 +150,13 @@ class DemoGame:
         return self.round is None or self.round.is_over
 
     def is_bot_turn(self) -> bool:
-        return not self.round_over and self.round.current_player in BOT_SEATS
+        return not self.round_over and self.round.current_player in self.bot_seats
 
     def bot_step(self) -> tuple:
         """Sıradaki bot hamlesini hesaplar ve uygular. (oyuncu, hamle) döndürür."""
         r = self.round
         p = r.current_player
-        assert p in BOT_SEATS and not r.is_over
+        assert p in self.bot_seats and not r.is_over
         mv = bot_decide(self.agents[p], r.observation(p), r.legal_moves(), self.match.public_state())
         self._apply(mv)
         return p, mv
@@ -135,17 +171,21 @@ class DemoGame:
         return mv
 
     def _apply(self, mv: Move) -> None:
+        n = len(self.round.events)
         self.round.apply(mv)
+        self.draws = [(e.player, 2) for e in self.round.events[n + 1:] if e.kind == "draw"]
         if self.round.is_over:
             self._finish_round()
 
     def _finish_round(self) -> None:
         r = self.round
         res = r.result
-        meta = {"match_seed": self.seed, "round_no": self.match.round_no, "human_seats": list(HUMAN_SEATS),
+        meta = {"match_seed": self.seed, "round_no": self.match.round_no, "human_seats": list(self.human_seats),
                 "bots": self.bot, "match_before": self.match_before, "domino_version": domino_version(),
                 "room": self.room_id, "team_full_info": self.team_full_info, "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
-        rec = from_round(r, "demo", meta).to_json()
+        if self.players == 2:
+            meta["redeals"] = self.match.last_redeals
+        rec = from_round(r, "demo", meta).to_json() if self.players == 4 else record_2p(r, meta)
         self.records.append(rec)
         if self.record_to:
             d = os.path.dirname(self.record_to)
@@ -162,8 +202,14 @@ class DemoGame:
         moves = []
         if r is not None and not r.is_over and r.current_player == player:
             moves = [move_to_dict(m) for m in r.legal_moves()]
-        missing = missing_from_events(r.events) if r is not None else [set() for _ in range(4)]
+        n = self.players
+        if n == 4:
+            missing = missing_from_events(r.events) if r is not None else [set() for _ in range(4)]
+        else:                                            # R-28: çekişle bilgi kalıcı değil, gösterilmez
+            missing = [set() for _ in range(n)]
         return {
+            "num_players": n,
+            "boneyard_size": len(r.boneyard) if n == 2 and r is not None else 0,
             "type": "game_state",
             "board": [list(t) for t in r.board] if r else [],
             "your_hand": [list(t) for t in r.hand(player)] if r else [],
@@ -173,12 +219,12 @@ class DemoGame:
             "legal_moves": moves,
             "left_val": r.left_end if r else -1,
             "right_val": r.right_end if r else -1,
-            "hand_sizes": list(r.hand_sizes()) if r else [7, 7, 7, 7],
+            "hand_sizes": list(r.hand_sizes()) if r else [7] * n,
             "pass_count": r.consecutive_passes if r else 0,
             "is_game_over": self.round_over,
             "team_scores": list(self.match.score),       # maç skoru (public, D-11)
             "players": names,
-            "missing_numbers": [[n in missing[p] for n in range(7)] for p in range(4)],
+            "missing_numbers": [[k in missing[p] for k in range(7)] for p in range(n)],
             "match": self.match.public_state(),
         }
 
@@ -191,7 +237,7 @@ class DemoGame:
             counted[1 - res.winner_team] = res.points
         else:
             counted = list(res.team_totals)
-        team = {0: "Takım A (Siz)", 1: "Takım B (Bot)"}
+        team = {0: "Takım A (Siz)", 1: "Takım B (Bot)"} if self.players == 4 else {0: "Sen", 1: "Bot"}
         if res.winner_team is None:
             line1 = f"Tur {m.round_no}: kapandı, eşitlik (+{res.pot_add} havuza)"
         else:
@@ -199,15 +245,17 @@ class DemoGame:
             line1 = f"Tur {m.round_no}: {team[res.winner_team]} kazandı, {how}, {res.points} puan"
             if m.pending[res.winner_team] and not m.unlocked[res.winner_team]:
                 line1 += f" (13 altı, bekliyor: {m.pending[res.winner_team]})"
-        line2 = f"Maç: A {m.score[0]} - B {m.score[1]} (hedef {m.cfg.target})"
+        sa, sb = ("A", "B") if self.players == 4 else ("Sen", "Bot")
+        line2 = f"Maç: {sa} {m.score[0]} - {sb} {m.score[1]} (hedef {m.cfg.target})"
         if m.winner is not None:
-            line2 = f"MAÇ BİTTİ: {team[m.winner]} kazandı! A {m.score[0]} - B {m.score[1]}"
+            line2 = f"MAÇ BİTTİ: {team[m.winner]} kazandı! {sa} {m.score[0]} - {sb} {m.score[1]}"
         return {
             "type": "game_over",
             "team_a_score": counted[0],
             "team_b_score": counted[1],
             "winner": line1 + "\n" + line2,
-            "hands": [[list(t) for t in r.hand(i)] for i in range(4)],
+            "hands": [[list(t) for t in r.hand(i)] for i in range(self.players)],
+            "num_players": self.players,
             "reason": res.reason,
             "round_winner_team": res.winner_team,
             "match": m.public_state(),
@@ -217,5 +265,6 @@ class DemoGame:
     def opening_text(self) -> str:
         r = self.round
         if r.forced_opening:
-            return f"Tur {self.match.round_no} başladı: (1|1) sahibi P{r.starter + 1} açar."
+            a, b = r.forced_opening
+            return f"Tur {self.match.round_no} başladı: ({a}|{b}) sahibi P{r.starter + 1} açar."
         return f"Tur {self.match.round_no} başladı: P{r.starter + 1} açar (son taşı koyan)."

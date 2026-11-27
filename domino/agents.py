@@ -61,8 +61,19 @@ def make_agent(name: str, seed) -> Agent:
     if name == "oracle" or name.startswith("oracle@"):
         from .oracle import OracleMCTS
         return OracleMCTS(seed, iterations=int(name.split("@")[1])) if "@" in name else OracleMCTS(seed)
+    # öğrenilmiş DMC ajanı (dmc.py, D-28): 'dmc:<yol.npz>' (numpy gerekir, torch gerekmez)
+    if name.startswith("dmc:"):
+        from .dmc import DMCAgent
+        return DMCAgent(seed, path=name[4:])
+    # öğrenme + arama melezi (hybrid.py, D-36): 'hyb-rand@200:c=1.0:T=0.05:lam=0.5[:cp=..][:net=yol.npz]'
+    if name.split("@")[0].split(":")[0].startswith("hyb"):
+        from .hybrid import make_hybrid
+        return make_hybrid(name, seed)
     # gizli bilgisiz arama (search.py): 'pimc', 'pimc@N', 'ismcts', 'ismcts@N' (N: hamle başı toplam iterasyon);
     # ağırlıklı determinizasyon (D-25): 'ismcts-rand@N', 'ismcts-pip@N', 'pimc-rand@N', 'pimc-pip@N'
+    # isteğe bağlı UCT sabiti (D-29 ayar ızgarası): '...:c=0.5', yoksa varsayılan 0,7 (D-23)
+    full = name
+    name, _, opt = name.partition(":c=")
     base = name.split("@")[0]
     for prefix in ("pimc", "ismcts"):
         if base == prefix or base.startswith(prefix + "-"):
@@ -72,7 +83,9 @@ def make_agent(name: str, seed) -> Agent:
             if model is not None and model not in PLAYER_MODELS:
                 raise ValueError(f"bilinmeyen oyuncu modeli: {model} (seçenekler: {', '.join(PLAYER_MODELS)})")
             kw = {"model": model} if model else {}
+            if opt:
+                kw["c"] = float(opt)
             return cls(seed, iterations=int(name.split("@")[1]), **kw) if "@" in name else cls(seed, **kw)
-    if name not in AGENTS:
-        raise ValueError(f"bilinmeyen ajan: {name} (seçenekler: {', '.join(AGENTS)})")
+    if opt or name not in AGENTS:
+        raise ValueError(f"bilinmeyen ajan: {full} (seçenekler: {', '.join(AGENTS)})")
     return AGENTS[name](seed)

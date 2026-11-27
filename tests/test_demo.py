@@ -646,3 +646,160 @@ async def _reconnect_session(port, main):
     assert j5["resumed"] is False and j5["room_id"] != ja["room_id"]
     await a5.close()
     await b.close()
+
+
+# ── T-DM9: 2 kişilik mod (R-20..R-28, domino.engine.Match2) ──────────
+
+from domino.engine import Match2, Observation2, Round2, norm  # noqa: E402
+
+
+def replay_2p(rec: dict) -> Round2:
+    """2 kişilik kaydı Round2'de yeniden oynat: çekişler motorda kendiliğinden, kayıttakiyle aynı olmalı."""
+    r = Round2([[tuple(t) for t in h] for h in rec["initial_hands"]], [tuple(t) for t in rec["initial_boneyard"]],
+               rec["starter"], tuple(rec["forced_opening"]) if rec["forced_opening"] else None)
+    plays = [e for e in rec["events"] if not e.get("draw")]
+    for e in plays:
+        if e.get("pass"):
+            r.apply(PASS)
+        else:
+            r.apply(Move(norm(tuple(e["tile"])), e["side"] if r.board else "R"))
+    got = [({"player": e.player, "tile": list(e.tile), "side": e.side} if e.kind == "play"
+            else {"player": e.player, e.kind: True}) for e in r.events]
+    assert got == rec["events"], "olay dizisi (çekişler dahil) kayıtla aynı değil"
+    res = r.result
+    assert res is not None and res.points == rec["result"]["points"] and res.winner_team == rec["result"]["winner_team"]
+    return r
+
+
+def play_full_match_2p(seed, rng, record_to="", max_rounds=80):
+    g = DemoGame(seed=seed, record_to=record_to, players=2)
+    draws_seen = 0
+    while True:
+        g.start_round()
+        while not g.round_over:
+            p = g.round.current_player
+            if p in g.bot_seats:
+                g.bot_step()
+            else:
+                g.human_move(p, human_choice(g, rng))
+            draws_seen += len(g.draws)
+        if g.match.winner is not None or g.match.round_no >= max_rounds:
+            return g, draws_seen
+
+
+def test_DM9_two_player_match_replays_and_equals_match2():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "2p.jsonl")
+        total_draws = 0
+        for s in range(6):
+            g, nd = play_full_match_2p(f"t2p{s}", random.Random(s), record_to=path)
+            assert g.match.winner in (0, 1) and isinstance(g.match, Match2)
+            assert g.human_seats == (0,) and g.bot_seats == (1,) and g.bot == game.DEFAULT_BOT_2P
+            m = Match2(g.seed)                                   # bağımsız referans maç
+            for rec in g.records:
+                assert rec["mode"] == "2p"
+                r_ref = m.new_round()
+                assert [list(map(list, h)) for h in r_ref.initial_hands] == rec["initial_hands"]
+                assert [list(t) for t in r_ref.initial_boneyard] == rec["initial_boneyard"]
+                r = replay_2p(rec)
+                m.apply_result(r.result)
+            assert m.score == g.match.score and m.winner == g.match.winner
+            total_draws += nd
+        assert total_draws > 0
+        lines = [json.loads(x) for x in open(path, encoding="utf-8")]
+        assert lines and all(x["mode"] == "2p" for x in lines)
+
+
+def test_DM9b_two_player_state_hides_opponent_and_boneyard():
+    g = DemoGame(seed="t2pstate", record_to="", players=2)
+    g.start_round()
+    rng = random.Random(3)
+    seen_obs = []
+
+    class Spy:
+        def act(self, obs, legal, match):
+            seen_obs.append(obs)
+            return legal[0]
+    g.agents = {1: Spy()}
+    while not g.round_over:
+        st = g.state_for(0, {0: "A"})
+        assert st["num_players"] == 2 and len(st["hand_sizes"]) == 2 and len(st["missing_numbers"]) == 2
+        assert st["boneyard_size"] == len(g.round.boneyard)
+        assert not any(any(row) for row in st["missing_numbers"])          # R-28: kalıcı yokluk gösterilmez
+        assert "boneyard" not in st and "hands" not in st
+        assert sorted(map(tuple, st["your_hand"])) == sorted(g.round.hand(0))
+        if g.round.current_player == 1:
+            g.bot_step()
+        else:
+            g.human_move(0, human_choice(g, rng))
+    assert seen_obs and all(isinstance(o, Observation2) and not hasattr(o, "boneyard") for o in seen_obs)
+    over = g.round_over_message()
+    assert over["num_players"] == 2 and len(over["hands"]) == 2
+    assert "Sen " in over["winner"].splitlines()[1] and " A " not in over["winner"]
+
+
+def test_DM9c_two_player_websocket():
+    try:
+        import uvicorn
+        import websockets
+    except ImportError as ex:
+        raise unittest.SkipTest(f"uvicorn/websockets yok: {ex}")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "ws2p.jsonl")
+        os.environ["DOMINO_RECORD_PATH_2P"] = path
+        import main
+        main.BOT_DELAY = 0.0
+        main.ROOM_SEED = "testws2p"
+        main.rooms.clear()
+        main.waiting_room = None
+        port = _free_port()
+        server = uvicorn.Server(uvicorn.Config(main.app, host="127.0.0.1", port=port, log_level="warning"))
+        th = threading.Thread(target=server.run, daemon=True)
+        th.start()
+        t0 = time.time()
+        while not server.started:
+            assert time.time() - t0 < 20, "sunucu başlamadı"
+            time.sleep(0.05)
+
+        async def session():
+            log = {"overs": 0, "drew": [], "bone": []}
+            rng = random.Random(5)
+            async with websockets.connect(f"ws://127.0.0.1:{port}/ws/Solo?mode=2") as ws:
+                joined = json.loads(await ws.recv())
+                assert joined["type"] == "joined" and joined["slot"] == 0 and not joined["waiting"]
+                assert joined["num_players"] == 2
+                assert main.waiting_room is None                    # 4 kişilik bekleme odası etkilenmez
+                acted = None
+                while log["overs"] < 3:
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+                    t = msg["type"]
+                    if t == "drew":
+                        log["drew"].append(msg["player"])
+                    elif t == "game_state":
+                        assert msg["num_players"] == 2 and "hands" not in msg
+                        log["bone"].append(msg["boneyard_size"])
+                        key = (json.dumps(msg["board"]), msg["hand_sizes"], msg["pass_count"], msg["match"]["round_no"])
+                        if msg["is_your_turn"] and key != acted:
+                            acted = key
+                            await ws.send(json.dumps({"type": "move", **rng.choice(msg["legal_moves"])}))
+                    elif t == "game_over":
+                        assert len(msg["hands"]) == 2
+                        log["overs"] += 1
+                        if log["overs"] < 3:
+                            await ws.send(json.dumps({"type": "rematch"}))
+                    elif t == "error":
+                        raise AssertionError(msg)
+            return log
+        try:
+            log = asyncio.run(session())
+        finally:
+            server.should_exit = True
+            th.join(10)
+            os.environ.pop("DOMINO_RECORD_PATH_2P", None)
+        recs = [json.loads(x) for x in open(path, encoding="utf-8")]
+        assert len(recs) == 3
+        for rec in recs:
+            replay_2p(rec)
+        rec_draws = [e["player"] for rec in recs for e in rec["events"] if e.get("draw")]
+        assert log["drew"] == rec_draws                       # her çekiş yayınlandı, kim çektiği doğru
+        assert all(b >= 2 for b in log["bone"])

@@ -21,7 +21,12 @@ from .engine import OPENING_TILE, IllegalMove, Match, MatchConfig, Round, deal_h
 AgentFactory = Callable[[str], Agent]   # tohum (str) -> yeni ajan
 
 
-def factory(name: str) -> AgentFactory:
+def factory(name: str):
+    """Ajan adı -> fabrika. Karışık takım (E-04x, partner bağımlılığı): 'X+Y' -> (X, Y) fabrika çifti; takımın
+    küçük numaralı koltuğuna X, diğerine Y oturur (takım 0: koltuk 0 = X, 2 = Y; takım 1: 1 = X, 3 = Y)."""
+    if "+" in name:
+        x, y = name.split("+")
+        return (factory(x), factory(y))
     return lambda seed: make_agent(name, seed)
 
 
@@ -40,8 +45,11 @@ def play_round(rnd: Round, agents: Sequence[Agent], match_state: Optional[dict] 
 
 
 def seat_agents(fa: AgentFactory, fb: AgentFactory, a_team: int, seed: str) -> List[Agent]:
-    """A takımı a_team'de. Her koltuğa kendi tohumuyla yeni ajan."""
-    return [(fa if team_of(s) == a_team else fb)(f"{seed}:s{s}") for s in range(4)]
+    """A takımı a_team'de. Her koltuğa kendi tohumuyla yeni ajan. Fabrika çifti (karışık takım) ise
+    takımın ilk koltuğuna (s // 2 == 0) ilk eleman, ikincisine ikinci eleman."""
+    def member(f, s):
+        return f[s // 2] if isinstance(f, tuple) else f
+    return [member(fa if team_of(s) == a_team else fb, s)(f"{seed}:s{s}") for s in range(4)]
 
 
 def l1_deal(seed, i: int) -> Round:

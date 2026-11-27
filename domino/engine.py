@@ -332,6 +332,11 @@ class Match:
         self._use_opening_rule = not any(self.unlocked)   # R-19
         self._next_starter = res.last_tile_player         # R-14
 
+    def next_start(self) -> Optional[int]:
+        """Sonraki turu kim başlatır (public: herkes son taşı kimin koyduğunu görür). None = R-19 açılış kuralı
+        (dağıtımda 1|1 kimdeyse o, 1|1 ile), yoksa koltuk (R-14)."""
+        return None if self._use_opening_rule else self._next_starter
+
     def public_state(self) -> dict:
         """Maç durumu: tamamen public (D-11)."""
         return {
@@ -341,3 +346,171 @@ class Match:
             "round_no": self.round_no,
             "target": self.cfg.target,
         }
+
+
+# ── 2 kişilik mod (R-20..R-28) ───────────────────────────────
+# 4 kişilik Round/Match koduna dokunulmaz; buradaki sınıflar yalnız farkları tanımlar (T-2P0: 4 kişilik iz bit bit aynı).
+
+OPENING_LADDER_2P: Tuple[Tile, ...] = ((1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (0, 0))  # R-25
+DRAW_BATCH_2P = 2          # R-21: bazardan 2'şer çekilir (ikisi birlikte)
+BONEYARD_RESERVE_2P = 2    # R-22: bazarın son 2 taşı çekilmez
+
+
+@dataclass(frozen=True)
+class Observation2(Observation):
+    """2 kişilik gözlem. Ek public bilgi: bazardaki taş sayısı (R-28). Bazarın içeriği YOK."""
+    boneyard_size: int = 0
+
+
+class Round2(Round):
+    """2 kişilik tur. Eller 7'şer, kalan 14 taş kapalı bazar (R-20). Oynanabilir taşı olmayan oyuncu sırası
+    gelince bazardan 2'şer çeker, oynanabilir taş gelene ya da bazarda 2 taş kalana kadar (R-21, R-22); çekme
+    zorunlu ve seçimsiz olduğu için motor kendiliğinden yapar ve public 'draw' olayı yazar. Kapanma 2 art arda
+    pas (R-23); bazardakiler puana girmez (R-24). Takım = oyuncu (team_of(p) = p % 2 = p)."""
+
+    def __init__(self, hands: Sequence[Sequence[Tile]], boneyard: Sequence[Tile], starter: int,
+                 forced_opening: Optional[Tile] = None):
+        if len(hands) != 2:
+            raise ValueError("2 el gerekli")
+        self._hands: List[set] = [set(norm(t) for t in h) for h in hands]
+        bone = [norm(t) for t in boneyard]
+        seen: set = set()
+        for h, orig in zip(self._hands, hands):
+            if len(h) != len(list(orig)):
+                raise ValueError("elde tekrar eden taş")
+            if seen & h:
+                raise ValueError("aynı taş iki elde")
+            seen |= h
+        if len(set(bone)) != len(bone) or seen & set(bone):
+            raise ValueError("bazarda tekrar eden taş")
+        seen |= set(bone)
+        if not all(t in ALL_TILES for t in seen):
+            raise ValueError("geçersiz taş")
+        if starter not in (0, 1):
+            raise ValueError("geçersiz başlayan")
+        if forced_opening is not None and norm(forced_opening) not in self._hands[starter]:
+            raise ValueError("başlayan oyuncuda zorunlu açılış taşı yok")
+        self.initial_hands: Tuple[Tuple[Tile, ...], ...] = tuple(tuple(sorted(h)) for h in self._hands)
+        self.initial_boneyard: Tuple[Tile, ...] = tuple(bone)
+        self.boneyard: List[Tile] = list(bone)   # gizli, sıralı; çekiş baştan
+        self.forced_opening = norm(forced_opening) if forced_opening else None
+        self.starter = starter
+        self.board: List[Tile] = []
+        self.current_player = starter
+        self.consecutive_passes = 0
+        self.events: List[Event] = []
+        self.last_tile_player: Optional[int] = None
+        self.result: Optional[RoundResult] = None
+
+    def apply(self, move: Move) -> None:
+        legal = self.legal_moves()
+        if move not in legal:
+            mirror = (bool(self.board) and not move.is_pass and move.side == "R"
+                      and self.left_end == self.right_end and Move(move.tile, "L") in legal)
+            if not mirror:
+                raise IllegalMove(f"yasadışı hamle: {move}")
+        p = self.current_player
+        lv, rv = self.left_end, self.right_end
+        if move.is_pass:
+            self.events.append(Event(p, "pass", None, None, lv, rv))
+            self.consecutive_passes += 1
+        else:
+            a, b = move.tile
+            self._hands[p].remove(move.tile)
+            if not self.board:
+                self.board.append((a, b))
+            elif move.side == "L":
+                self.board.insert(0, (a, b) if b == lv else (b, a))
+            else:
+                self.board.append((a, b) if a == rv else (b, a))
+            self.consecutive_passes = 0
+            self.last_tile_player = p
+            self.events.append(Event(p, "play", move.tile, move.side, lv, rv))
+
+        if not move.is_pass and not self._hands[p]:
+            self._finish("out", finisher=p)
+        elif self.consecutive_passes >= 2:               # R-23: 2 art arda pas
+            self._finish("blocked", finisher=None)
+        else:
+            self.current_player = (p + 1) % 2
+            self._draw_until_playable()
+
+    def _draw_until_playable(self) -> None:
+        """R-21/R-22: sırası gelen oyuncunun oynanabilir taşı yoksa 2'şer çeker. Masa burada hiç boş değildir."""
+        q = self.current_player
+        lv, rv = self.left_end, self.right_end
+        hand = self._hands[q]
+        while (len(self.boneyard) - BONEYARD_RESERVE_2P >= DRAW_BATCH_2P
+               and not any(lv in t or rv in t for t in hand)):
+            for _ in range(DRAW_BATCH_2P):
+                hand.add(self.boneyard.pop(0))
+            self.events.append(Event(q, "draw", None, None, lv, rv))
+
+    def team_totals(self) -> Tuple[int, int]:
+        v = [hand_value(h) for h in self._hands]
+        return (v[0], v[1])                              # R-24: bazar sayılmaz
+
+    def observation(self, player: int) -> Observation2:
+        return Observation2(
+            player=player,
+            hand=self.hand(player),
+            board=tuple(self.board),
+            left_end=self.left_end,
+            right_end=self.right_end,
+            hand_sizes=self.hand_sizes(),
+            current_player=self.current_player,
+            consecutive_passes=self.consecutive_passes,
+            events=tuple(self.events),
+            boneyard_size=len(self.boneyard),
+        )
+
+    def clone(self) -> "Round2":
+        r = Round2.__new__(Round2)
+        r.__dict__.update(self.__dict__)
+        r._hands = [set(h) for h in self._hands]
+        r.board = list(self.board)
+        r.events = list(self.events)
+        r.boneyard = list(self.boneyard)
+        return r
+
+
+def deal_hands2(match_seed, round_no: int, attempt: int = 0) -> Tuple[List[List[Tile]], List[Tile]]:
+    """2 kişilik dağıtım (R-20): 7 + 7 + 14 bazar. (tohum, tur no, deneme) ile deterministik."""
+    rng = random.Random(f"2P:{match_seed}:{round_no}:{attempt}")
+    tiles = list(ALL_TILES)
+    rng.shuffle(tiles)
+    return [sorted(tiles[0:7]), sorted(tiles[7:14])], tiles[14:]
+
+
+def opening_2p(hands: Sequence[Sequence[Tile]]) -> Optional[Tuple[int, Tile]]:
+    """R-25: 1|1, yoksa 2|2 ... 6|6, yoksa 0|0 sahibi o çiftle başlar. Hiçbiri yoksa None (yeniden dağıtım)."""
+    for d in OPENING_LADDER_2P:
+        for i, h in enumerate(hands):
+            if d in {norm(t) for t in h}:
+                return i, d
+    return None
+
+
+class Match2(Match):
+    """2 kişilik maç. Puan yazma (R-09..R-19) Match ile aynı, takım = oyuncu. Fark yalnız dağıtım ve açılış:
+    açılış kuralı geçerliyken (ilk tur ve R-27) R-25 merdiveni, çift yoksa sınırsız yeniden dağıtım."""
+
+    def __init__(self, seed=0, config: Optional[MatchConfig] = None):
+        super().__init__(seed, config)
+        self.last_redeals = 0
+
+    def new_round(self) -> Round2:
+        self.round_no += 1
+        self.last_redeals = 0
+        if self._use_opening_rule:
+            attempt = 0
+            while True:
+                hands, bone = deal_hands2(self.seed, self.round_no, attempt)
+                op = opening_2p(hands)
+                if op is not None:
+                    break
+                attempt += 1                             # R-25: yeniden dağıtım
+            self.last_redeals = attempt
+            return Round2(hands, bone, op[0], forced_opening=op[1])
+        hands, bone = deal_hands2(self.seed, self.round_no)
+        return Round2(hands, bone, self._next_starter)   # R-26
